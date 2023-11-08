@@ -1,9 +1,61 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <getopt.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <stdint.h>
+
+typedef struct {
+    int dim; // transformer dimension
+    int hidden_dim; // ffn layer dimension
+    int n_layers; // number of transformer layers
+    int n_heads; // number of query heads
+    int n_kv_heads; // number of k/v heads
+    int vocab_size; // vocabulary size, usually 256 (byte-level)
+    int max_seq_len; // maximum sequence length to generate
+} Config;
+
+// RunState definition
+typedef struct {
+    float *x; // activation at current time stamp (dim,)
+    float *xb; // same, but insize a residual branch (dim,)
+    float *xb2; // an additional buffer just for convenience (dim,)
+    float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
+    float *hb2; // bufffer for hidden dimension in the ffn (hidden_dim,)
+    float *q; // query (dim,)
+    float *k; // key (dim,)
+    float *v; // value (dim,)
+    float *att; // buffer for the scores/attention avlues (n_heads, seq_len)
+    float *logits; // output logits
+    // kv cache
+    float *key_cache; // (layer, seq_len, dim)
+    float *value_cache; // (layer , seq_len, dim)
+} RunState;
+
+// Transformer definition
+typedef struct {
+    Config config;
+    // TransformerWeights weights; // model weights
+    RunState state; // buffer required to store intermediate values during forward pass
+    int fd; // file descriptor required for memory mapping, explained later TODO
+    float *data; //memory mapped data pointer, TODO
+    uint64_t file_size; // size of the model checkpoint file in bytes
+} Transformer;
+
+void read_config(char *checkpoint, Transformer *transformer) {
+    FILE *file = fopen(checkpoint, "rb");   // "rb" for openning binary file
+    if (file == NULL) {fprintf(stderr, "Failed to checkpoint file %s\n", checkpoint); exit(EXIT_FAILURE);}
+    // read in the config header
+    if (fread(checkpoint, sizeof(Config), 1, file) != 1) {fprintf(stderr, "Read from checkpoint %s failed due to an error or EOF\n", checkpoint); exit(EXIT_FAILURE);}
+}
+
+void build_transformer(Transformer *transformer, char *checkpoint_path) {
+    // read in Config and the Weights from the checkpoint
+    read_config(checkpoint_path, transformer);
+}
 
 // long arguments
 static struct option long_options[] = {
@@ -112,6 +164,16 @@ int main(int argc, char *argv[]) {
                 break;
         }
     }
+
+    // parameter validation/correction
+    if (rng_seed <= 0) {rng_seed = (unsigned long long)time(NULL);}
+    if (temperature < 0.0) {temperature = 0.0f;}
+    if (topp < 0.0 || 1.0 <= topp) {topp = 0.9f;}
+    if (steps < 0) {steps = 0;}
+
+    // build Transformer from given model .bin file
+    Transformer transformer;
+    build_transformer(&transformer, checkpoint_path);
 
     return 0;
 }
