@@ -6,7 +6,26 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <stdint.h>
+
+#ifndef checkCudaErrors
+#define checkCudaErrors(err) __checkCudaErrors(err, __FILE__, __LINE__)
+
+inline void __checkCudaErrors(CUresult err, const char *file, const int line) {
+  if (CUDA_SUCCESS != err) {
+    const char *errorStr = NULL;
+    cuGetErrorString(err, &errorStr);
+    fprintf(stderr,
+            "checkCudaErrors() Driver API error = %04d \"%s\" from file <%s>, "
+            "line %i.\n",
+            err, errorStr, file, line);
+    exit(EXIT_FAILURE);
+  }
+}
+#endif
 
 typedef struct {
     int dim; // transformer dimension
@@ -17,6 +36,27 @@ typedef struct {
     int vocab_size; // vocabulary size, usually 256 (byte-level)
     int max_seq_len; // maximum sequence length to generate
 } Config;
+
+typedef struct {
+    // token embedding table
+    float* token_embedding_table;    // (vocab_size, dim)
+    // weights for rmsnorms
+    float* rms_att_weight; // (layer, dim) rmsnorm weights
+    float* rms_ffn_weight; // (layer, dim)
+    // weights for matmuls. note dim == n_heads * head_size
+    float* wq; // (layer, dim, n_heads * head_size)
+    float* wk; // (layer, dim, n_kv_heads * head_size)
+    float* wv; // (layer, dim, n_kv_heads * head_size)
+    float* wo; // (layer, n_heads * head_size, dim)
+    // weights for ffn
+    float* w1; // (layer, hidden_dim, dim)
+    float* w2; // (layer, dim, hidden_dim)
+    float* w3; // (layer, hidden_dim, dim)
+    // final rmsnorm
+    float* rms_final_weight; // (dim,)
+    // (optional) classifier weights for the logits, on the last layer
+    float* wcls;
+} TransformerWeights;
 
 // RunState definition
 typedef struct {
@@ -38,23 +78,38 @@ typedef struct {
 // Transformer definition
 typedef struct {
     Config config;
-    // TransformerWeights weights; // model weights
+    TransformerWeights weights; // model weights
     RunState state; // buffer required to store intermediate values during forward pass
     int fd; // file descriptor required for memory mapping, explained later TODO
     float *data; //memory mapped data pointer, TODO
     uint64_t file_size; // size of the model checkpoint file in bytes
 } Transformer;
 
-void read_config(char *checkpoint, Transformer *transformer) {
+void read_checkpoint(char *checkpoint, Transformer *transformer) {
+    Config *config = &(transformer->config);
     FILE *file = fopen(checkpoint, "rb");   // "rb" for openning binary file
     if (file == NULL) {fprintf(stderr, "Failed to checkpoint file %s\n", checkpoint); exit(EXIT_FAILURE);}
     // read in the config header
-    if (fread(checkpoint, sizeof(Config), 1, file) != 1) {fprintf(stderr, "Read from checkpoint %s failed due to an error or EOF\n", checkpoint); exit(EXIT_FAILURE);}
+    if (fread(config, sizeof(Config), 1, file) != 1) {
+        fprintf(stderr, "Read config from checkpoint %s failed due to an error or EOF\n", checkpoint); exit(EXIT_FAILURE);
+    }
+    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
+    int shared_weights = config->vocab_size > 0 ? 1 : 0;
+    config->vocab_size = abs(config->vocab_size);
+    // figure out the file size
+    fseek(file, 0, SEEK_END); // move file pointer to end of file
+    transformer->file_size = ftell(file);
+    fclose(file);
+    // memory map the Transformer weights into the data pointer
+    transformer->fd = open(checkpoint, O_RDONLY);
+    if (transformer->fd == -1) { fprintf(stderr, "open checkpoint failed!\n"); exit(EXIT_FAILURE); }
+    checkCudaErrors(cudaMallocManaged((void **)&transformer->data, transformer->file_size+1));
+
 }
 
 void build_transformer(Transformer *transformer, char *checkpoint_path) {
     // read in Config and the Weights from the checkpoint
-    read_config(checkpoint_path, transformer);
+    read_checkpoint(checkpoint_path, transformer);
 }
 
 // long arguments
