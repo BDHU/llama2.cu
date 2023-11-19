@@ -10,22 +10,41 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <assert.h>
+
+#include "cuda.h"
+#include "cuda_runtime.h"
 
 #ifndef checkCudaErrors
-#define checkCudaErrors(err) __checkCudaErrors(err, __FILE__, __LINE__)
+#define checkCudaErrors(err) __checkCudaErrors (err, __FILE__, __LINE__)
 
-inline void __checkCudaErrors(CUresult err, const char *file, const int line) {
-  if (CUDA_SUCCESS != err) {
-    const char *errorStr = NULL;
-    cuGetErrorString(err, &errorStr);
-    fprintf(stderr,
-            "checkCudaErrors() Driver API error = %04d \"%s\" from file <%s>, "
-            "line %i.\n",
-            err, errorStr, file, line);
-    exit(EXIT_FAILURE);
-  }
+inline void __checkCudaErrors( cudaError err, const char *file, const int line )
+{
+    if (cudaSuccess != err) {
+        fprintf(stderr, "%s(%i) : CUDA Runtime API error %d: %s.\n",
+                file, line, (int)err, cudaGetErrorString( err ) );
+        exit(-1);
+    }
 }
 #endif
+
+// ----------------------------------------------------------------------------
+// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
+// ----------------------------------------------------------------------------
+
+typedef struct {
+    char *str;
+    int id;
+} TokenIndex;
+
+typedef struct {
+    char **vocab;
+    float **vocab_scores;
+    TokenIndex *sorted_vocab;
+    int vocab_size;
+    unsigned int max_token_length;
+    unsigned char byte_pieces[512]; // stores all single-byte strings
+} Tokenizer;
 
 typedef struct {
     int dim; // transformer dimension
@@ -81,14 +100,77 @@ typedef struct {
     TransformerWeights weights; // model weights
     RunState state; // buffer required to store intermediate values during forward pass
     int fd; // file descriptor required for memory mapping, explained later TODO
-    float *data; //memory mapped data pointer, TODO
+    float *data; // data pointer, TODO
     uint64_t file_size; // size of the model checkpoint file in bytes
 } Transformer;
+
+void alloc_run_state(RunState *s, Config config) {
+    int kv_dim = config.dim * config.n_kv_heads / config.n_heads;
+    checkCudaErrors(cudaMallocManaged((void **)&s->x, config.dim * sizeof(float)));
+    checkCudaErrors(cudaMallocManaged((void **)&s->xb, config.dim * sizeof(float)));
+    checkCudaErrors(cudaMallocManaged((void **)&s->xb2, config.dim * sizeof(float)));
+    checkCudaErrors(cudaMallocManaged((void **)&s->hb, config.hidden_dim * sizeof(float)));
+    checkCudaErrors(cudaMallocManaged((void **)&s->hb2, config.hidden_dim * sizeof(float)));
+    checkCudaErrors(cudaMallocManaged((void **)&s->q, config.dim * sizeof(float)));
+    checkCudaErrors(cudaMallocManaged((void **)&s->key_cache, config.n_layers * config.max_seq_len * kv_dim * sizeof(float)));
+    checkCudaErrors(cudaMallocManaged((void **)&s->value_cache, config.n_layers * config.max_seq_len * kv_dim * sizeof(float)));
+    checkCudaErrors(cudaMallocManaged((void **)&s->att, config.n_heads * config.max_seq_len * sizeof(float)));
+    checkCudaErrors(cudaMallocManaged((void **)&s->logits, config.vocab_size * sizeof(float)));
+}
+
+void free_run_state(RunState *s) {
+    checkCudaErrors(cudaFree((void *)s->x));
+    checkCudaErrors(cudaFree((void *)s->xb));
+    checkCudaErrors(cudaFree((void *)s->xb2));
+    checkCudaErrors(cudaFree((void *)s->hb));
+    checkCudaErrors(cudaFree((void *)s->hb2));
+    checkCudaErrors(cudaFree((void *)s->q));
+    checkCudaErrors(cudaFree((void *)s->key_cache));
+    checkCudaErrors(cudaFree((void *)s->value_cache));
+    checkCudaErrors(cudaFree((void *)s->att));
+    checkCudaErrors(cudaFree((void *)s->logits));
+}
+
+void build_tokenizer(Tokenizer *t, char *tokenizer_path, int vocab_size) {
+    // should've written the vocab_size into the tokenizer file... sigh
+    t->vocab_size = vocab_size;
+}
+
+void memory_map_weights(TransformerWeights *w, Config config, float *ptr, int shared_weights) {
+    int head_size = config.dim / config.n_heads;
+    // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
+    unsigned long long n_layers = config.n_layers;
+    w->token_embedding_table = ptr;
+    ptr += config.vocab_size * config.dim;
+    w->rms_att_weight = ptr;
+    ptr += n_layers * config.dim;
+    w->wq = ptr;
+    ptr += n_layers * config.dim * (config.n_heads * head_size);
+    w->wk = ptr;
+    ptr += n_layers * config.dim * (config.n_kv_heads * head_size);
+    w->wv = ptr;
+    ptr += n_layers * config.dim * (config.n_kv_heads * head_size);
+    w->wo = ptr;
+    ptr += n_layers * (config.n_heads * head_size) * config.dim;
+    w->rms_ffn_weight = ptr;
+    ptr += n_layers * config.dim;
+    w->w1 = ptr;
+    ptr += n_layers * config.dim * config.hidden_dim;
+    w->w2 = ptr;
+    ptr += n_layers * config.hidden_dim * config.dim;
+    w->w3 = ptr;
+    ptr += n_layers * config.dim * config.hidden_dim;
+    w->rms_final_weight = ptr;
+    ptr += config.dim;
+    ptr += config.max_seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
+    ptr += config.max_seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
+    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+}
 
 void read_checkpoint(char *checkpoint, Transformer *transformer) {
     Config *config = &(transformer->config);
     FILE *file = fopen(checkpoint, "rb");   // "rb" for openning binary file
-    if (file == NULL) {fprintf(stderr, "Failed to checkpoint file %s\n", checkpoint); exit(EXIT_FAILURE);}
+    if (file == NULL) {fprintf(stderr, "Failed to open checkpoint file %s\n", checkpoint); exit(EXIT_FAILURE);}
     // read in the config header
     if (fread(config, sizeof(Config), 1, file) != 1) {
         fprintf(stderr, "Read config from checkpoint %s failed due to an error or EOF\n", checkpoint); exit(EXIT_FAILURE);
@@ -104,12 +186,15 @@ void read_checkpoint(char *checkpoint, Transformer *transformer) {
     transformer->fd = open(checkpoint, O_RDONLY);
     if (transformer->fd == -1) { fprintf(stderr, "open checkpoint failed!\n"); exit(EXIT_FAILURE); }
     checkCudaErrors(cudaMallocManaged((void **)&transformer->data, transformer->file_size+1));
-
+    float *weights_ptr = transformer->data + sizeof(Config) / sizeof(float);
+    memory_map_weights(&transformer->weights, transformer->config, weights_ptr, shared_weights);
 }
 
 void build_transformer(Transformer *transformer, char *checkpoint_path) {
     // read in Config and the Weights from the checkpoint
     read_checkpoint(checkpoint_path, transformer);
+    // allocate the RunState buffers
+    alloc_run_state(&transformer->state, transformer->config);
 }
 
 // long arguments
@@ -152,13 +237,13 @@ int main(int argc, char *argv[]) {
 
     // Parameter setup
     char *checkpoint_path = NULL;   // e.g. models/llama2-7b.bin
-    char *tokenizer_path = "tokenizer.bin";
+    char *tokenizer_path = (char *)"tokenizer.bin";
     float temperature = 1.0f;   // higher temperature leads to more creative generations
     float topp = 0.9f;  // nucleas sampling.
     int steps = 256;
     char *prompt = NULL;
     unsigned long long rng_seed = 0;
-    char *mode = "generate";    // generate|chat
+    char *mode = (char *)"generate";    // generate|chat
     char *system_prompt = NULL;     // optional system prompt used in chat mode
     bool stream = false;
     int layers = -1;    // layers to offload to CPU
@@ -229,6 +314,11 @@ int main(int argc, char *argv[]) {
     // build Transformer from given model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path);
+    if (steps == 0 || steps > transformer.config.max_seq_len) {steps = transformer.config.max_seq_len;}
+
+    // build the tokenizer via the tokenizer .bin file
+    Tokenizer tokenizer; 
+    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
 
     return 0;
 }
