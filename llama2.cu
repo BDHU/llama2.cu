@@ -46,6 +46,29 @@ typedef struct {
     unsigned char byte_pieces[512]; // stores all single-byte strings
 } Tokenizer;
 
+// ----------------------------------------------------------------------------
+// The Sampler, which takes logits and returns a sampled token
+// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
+// ----------------------------------------------------------------------------
+
+typedef struct {
+    float prob;
+    int index;
+} ProbIndex; // struct used when sorting probabilities during top-p sampling
+
+typedef struct {
+    int vocab_size;
+    ProbIndex *probindex;   // buffer used in top-p sampling
+    float temperature;
+    float topp;
+    unsigned long long rng_state;
+} Sampler;
+
+
+// ----------------------------------------------------------------------------
+// Transformer-related structs
+// ----------------------------------------------------------------------------
+
 typedef struct {
     int dim; // transformer dimension
     int hidden_dim; // ffn layer dimension
@@ -104,6 +127,123 @@ typedef struct {
     uint64_t file_size; // size of the model checkpoint file in bytes
 } Transformer;
 
+// ----------------------------------------------------------------------------
+// Sampler
+// ----------------------------------------------------------------------------
+
+void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
+    sampler->vocab_size = vocab_size;
+    sampler->temperature = temperature;
+    sampler->topp = topp;
+    sampler->rng_state = rng_seed;
+    // buffer only used with nucleus sampling; may not need but it's ~small
+    sampler->probindex = (ProbIndex *)malloc(sampler->vocab_size * sizeof(ProbIndex));
+}
+
+void free_sampler(Sampler *sampler) {
+    free(sampler->probindex);
+}
+
+// ----------------------------------------------------------------------------
+// Tokenizer
+// ----------------------------------------------------------------------------
+
+int compare_tokens(const void *a, const void *b) {
+    return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
+}
+
+void build_tokenizer(Tokenizer *t, char *tokenizer_path, int vocab_size) {
+    // should've written the vocab_size into the tokenizer file... sigh
+    t->vocab_size = vocab_size;
+    // allocate space to hold the scores and the strings
+    t->vocab = (char **)malloc(vocab_size * sizeof(char *));
+    t->vocab_scores = (float *)malloc(vocab_size * sizeof(float));
+    t->sorted_vocab = NULL; // initialized lazily
+    for (int i = 0; i < 256; i++) {
+        t->byte_pieces[i * 2] = (unsigned char)i;
+        t->byte_pieces[i * 2 + 1] = '\0';
+    }
+    // read in the file
+    FILE *file = fopen(tokenizer_path, "rb");
+    if (!file) {fprintf(stderr, "couldn't load %s\n", tokenizer_path); exit(EXIT_FAILURE);}
+    if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) {fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);}
+    int len = 0;
+    for (int i = 0; i < vocab_size; i++) {
+        if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) {fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);}
+        if (fread(&len, sizeof(int), 1, file) != 1) {fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);}
+        t->vocab[i] = (char *)malloc(len + 1);
+        if (fread(t->vocab[i], len, 1, file) != 1) {fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);}
+        t->vocab[i][len] = '\0'; // add the string terminating token
+    }
+    fclose(file);
+}
+
+void free_tokenizer(Tokenizer *t) {
+    for (int i = 0; i < t->vocab_size; i++) { free(t->vocab[i]); }
+    free(t->vocab);
+    free(t->vocab_scores);
+    free(t->sorted_vocab);
+}
+
+int str_lookup(char *str, const TokenIndex *sorted_vocab, size_t vocab_size) {
+    // efficiently find the perfect match for str in vocab, return its index or -1 if not found
+    const TokenIndex tok = { .str = str }; // acts as the key to search for
+    TokenIndex *res = (TokenIndex *)bsearch((const void *)&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    return res != NULL ? res->id : -1;
+}
+
+void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+    // encode the string text (input) into an upper-bound preallocated tokens[] array
+    // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
+    if (text == NULL) {fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE);}
+
+    printf("vocab_size is %d\n", t->vocab_size);
+    if (t->sorted_vocab == NULL) {
+        // lazily alloc and sort the vocabulary
+        checkCudaErrors(cudaMallocManaged((void **)&t->sorted_vocab, t->vocab_size * sizeof(TokenIndex)));
+        for (int i = 0; i < t->vocab_size; i++) {
+            t->sorted_vocab[i].str = t->vocab[i];
+            t->sorted_vocab[i].id = i;
+        }
+        qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
+    }
+
+    // create a temporary buffer that will store merge candidates of always two consecutive tokens
+    // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
+    char *str_buffer = (char *)malloc((t->max_token_length*2 +1 +2) * sizeof(char));
+    size_t str_len = 0;
+
+    // start at 0 tokens
+    *n_tokens = 0;
+
+    // add optional BOS (=1) token, if desired
+    if (bos) {tokens[(*n_tokens)++] = 1;}
+
+    // add_dummy_prefix is true by default
+    // so prepend a dummy prefix token to the input string, but only if text != ""
+    // TODO: pretty sure this isn't correct in the general case but I don't have the
+    // energy to read more of the sentencepiece code to figure out what it's doing
+    if (text[0] != '\0') {
+        int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+        printf("dummy prefix %d\n", dummy_prefix);
+        tokens[(*n_tokens)++] = dummy_prefix;
+    }
+
+    // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
+    // Code point ↔ UTF-8 conversion
+    // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
+    // U+0000	U+007F	    0xxxxxxx
+    // U+0080	U+07FF	    110xxxxx	10xxxxxx
+    // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
+    // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
+
+    // process the raw (UTF-8) byte sequence of the input string
+}
+
+// ----------------------------------------------------------------------------
+// Transformer
+// ----------------------------------------------------------------------------
+
 void alloc_run_state(RunState *s, Config config) {
     int kv_dim = config.dim * config.n_kv_heads / config.n_heads;
     checkCudaErrors(cudaMallocManaged((void **)&s->x, config.dim * sizeof(float)));
@@ -129,19 +269,6 @@ void free_run_state(RunState *s) {
     checkCudaErrors(cudaFree((void *)s->value_cache));
     checkCudaErrors(cudaFree((void *)s->att));
     checkCudaErrors(cudaFree((void *)s->logits));
-}
-
-void build_tokenizer(Tokenizer *t, char *tokenizer_path, int vocab_size) {
-    // should've written the vocab_size into the tokenizer file... sigh
-    t->vocab_size = vocab_size;
-    // allocate space to hold the scores and the strings
-    t->vocab = (char **)malloc(vocab_size * sizeof(char *));
-    t->vocab_scores = (float *)malloc(vocab_size * sizeof(float));
-    t->sorted_vocab = NULL; // initialized lazily
-    for (int i = 0; i < 256; i++) {
-        t->byte_pieces[i * 2] = (unsigned char)i;
-        t->byte_pieces[i * 2 + 1] = '\0';
-    }
 }
 
 void memory_map_weights(TransformerWeights *w, Config config, float *ptr, int shared_weights) {
@@ -196,6 +323,7 @@ void read_checkpoint(char *checkpoint, Transformer *transformer) {
     checkCudaErrors(cudaMallocManaged((void **)&transformer->data, transformer->file_size+1));
     float *weights_ptr = transformer->data + sizeof(Config) / sizeof(float);
     memory_map_weights(&transformer->weights, transformer->config, weights_ptr, shared_weights);
+    if (transformer->fd != -1) {close(transformer->fd);}
 }
 
 void build_transformer(Transformer *transformer, char *checkpoint_path) {
@@ -203,6 +331,28 @@ void build_transformer(Transformer *transformer, char *checkpoint_path) {
     read_checkpoint(checkpoint_path, transformer);
     // allocate the RunState buffers
     alloc_run_state(&transformer->state, transformer->config);
+}
+
+void free_transformer(Transformer* t) {
+    // close the memory mapping
+    checkCudaErrors(cudaFree(t->data));
+    // free the RunState buffers
+    free_run_state(&t->state);
+}
+
+// ----------------------------------------------------------------------------
+// generation loop
+// ----------------------------------------------------------------------------
+
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+    char *empty_prompt = "";
+    if (prompt == NULL) {prompt = empty_prompt;}
+
+    // encode the (string) prompt into tokens sequence
+    int num_prompt_tokens = 0;
+    int *prompt_tokens = NULL;
+    checkCudaErrors(cudaMallocManaged((void **)&prompt_tokens, sizeof(int) * strlen(prompt)+3)); // +3 for '\0', ?BOS, ?EOS
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
 }
 
 // long arguments
@@ -327,6 +477,22 @@ int main(int argc, char *argv[]) {
     // build the tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
     build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+
+    // build the Sampler
+    Sampler sampler;
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+
+    // run!
+    if (strcmp(mode, "generate") == 0) {
+        generate(&transformer, &tokenizer, &sampler, prompt, steps);
+    } else {
+        fprintf(stderr, "unknown mode: %s\n", mode);
+        help_msg();
+    }
+
+    free_sampler(&sampler);
+    free_tokenizer(&tokenizer);
+    free_transformer(&transformer);
 
     return 0;
 }
