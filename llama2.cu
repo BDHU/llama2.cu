@@ -39,7 +39,7 @@ typedef struct {
 
 typedef struct {
     char **vocab;
-    float **vocab_scores;
+    float *vocab_scores;
     TokenIndex *sorted_vocab;
     int vocab_size;
     unsigned int max_token_length;
@@ -134,6 +134,14 @@ void free_run_state(RunState *s) {
 void build_tokenizer(Tokenizer *t, char *tokenizer_path, int vocab_size) {
     // should've written the vocab_size into the tokenizer file... sigh
     t->vocab_size = vocab_size;
+    // allocate space to hold the scores and the strings
+    t->vocab = (char **)malloc(vocab_size * sizeof(char *));
+    t->vocab_scores = (float *)malloc(vocab_size * sizeof(float));
+    t->sorted_vocab = NULL; // initialized lazily
+    for (int i = 0; i < 256; i++) {
+        t->byte_pieces[i * 2] = (unsigned char)i;
+        t->byte_pieces[i * 2 + 1] = '\0';
+    }
 }
 
 void memory_map_weights(TransformerWeights *w, Config config, float *ptr, int shared_weights) {
@@ -317,7 +325,7 @@ int main(int argc, char *argv[]) {
     if (steps == 0 || steps > transformer.config.max_seq_len) {steps = transformer.config.max_seq_len;}
 
     // build the tokenizer via the tokenizer .bin file
-    Tokenizer tokenizer; 
+    Tokenizer tokenizer;
     build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
 
     return 0;
