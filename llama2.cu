@@ -193,11 +193,12 @@ int str_lookup(char *str, const TokenIndex *sorted_vocab, size_t vocab_size) {
 }
 
 void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+    // byte-pair encoding tokenization, more explanation can be found at: https://huggingface.co/learn/nlp-course/chapter6/5?fw=pt
+
     // encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
     if (text == NULL) {fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE);}
 
-    printf("vocab_size is %d\n", t->vocab_size);
     if (t->sorted_vocab == NULL) {
         // lazily alloc and sort the vocabulary
         checkCudaErrors(cudaMallocManaged((void **)&t->sorted_vocab, t->vocab_size * sizeof(TokenIndex)));
@@ -279,6 +280,42 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         }
         str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
     }
+
+    // merge the best consecutive pair each iteration, according to the scores in vocab_scores
+    while (1) {
+        float best_score = -1e10;
+        int best_id = -1;
+        int best_idx = -1;
+
+        for (int i=0; i < (*n_tokens-1); i++) {
+            // check if we can merge the pair (tokens[i], tokens[i+1])
+            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
+            int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+            if (id != -1 && t->vocab_scores[id] > best_score) {
+                // this merge pair exists in vocab! record its score and position
+                best_score = t->vocab_scores[id];
+                best_id = id;
+                best_idx = i;
+            }
+        }
+
+        if (best_idx == -1) {
+            break; // we couldn't find any more pairs to merge, so we're done
+        }
+
+        // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
+        tokens[best_idx] = best_id;
+        // delete token at position best_idx+1, shift the entire sequence back 1
+        for (int i = best_idx+1; i < (*n_tokens-1); i++) {
+            tokens[i] = tokens[i+1];
+        }
+        (*n_tokens)--; // token length decreased
+    }
+
+    // add optional EOS (=2) token, if desired
+    if (eos) tokens[(*n_tokens)++] = 2;
+
+    free(str_buffer);
 }
 
 // ----------------------------------------------------------------------------
