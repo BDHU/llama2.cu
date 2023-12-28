@@ -12,8 +12,12 @@
 #include <stdint.h>
 #include <assert.h>
 
+// CUDA headers
 #include "cuda.h"
 #include "cuda_runtime.h"
+
+#include <cooperative_groups.h>
+using namespace cooperative_groups;
 
 #ifndef checkCudaErrors
 #define checkCudaErrors(err) __checkCudaErrors (err, __FILE__, __LINE__)
@@ -27,6 +31,8 @@ inline void __checkCudaErrors( cudaError err, const char *file, const int line )
     }
 }
 #endif
+
+#define BLOCKSIZE 256   // TODO: may need to change this later
 
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
@@ -103,6 +109,7 @@ typedef struct {
 // RunState definition
 typedef struct {
     float *x; // activation at current time stamp (dim,)
+    float *partial_sum; // uses to save temporary reduce results from RMSNorm
     float *xb; // same, but insize a residual branch (dim,)
     float *xb2; // an additional buffer just for convenience (dim,)
     float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
@@ -226,7 +233,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     // TODO: pretty sure this isn't correct in the general case but I don't have the
     // energy to read more of the sentencepiece code to figure out what it's doing
     if (text[0] != '\0') {
-        int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+        int dummy_prefix = str_lookup((char *)" ", t->sorted_vocab, t->vocab_size);
         printf("dummy prefix %d\n", dummy_prefix);
         tokens[(*n_tokens)++] = dummy_prefix;
     }
@@ -322,18 +329,35 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 // Transformer
 // ----------------------------------------------------------------------------
 
-void alloc_run_state(RunState *s, Config config) {
+void alloc_run_state(RunState *s, Config config, int device) {
     int kv_dim = config.dim * config.n_kv_heads / config.n_heads;
     checkCudaErrors(cudaMallocManaged((void **)&s->x, config.dim * sizeof(float)));
+    checkCudaErrors(cudaMemPrefetchAsync(s->x, config.dim * sizeof(float), device));
+
+
+    // calculate RMS norm partial reduce output buffer size
+    checkCudaErrors(cudaMallocManaged((void **)&s->partial_sum, config.dim * sizeof(float)));   // TODO: may need to reduce the size for partial sum
+    checkCudaErrors(cudaMemPrefetchAsync(s->partial_sum, config.dim * sizeof(float), device));
+
+
     checkCudaErrors(cudaMallocManaged((void **)&s->xb, config.dim * sizeof(float)));
+    checkCudaErrors(cudaMemPrefetchAsync(s->xb, config.dim * sizeof(float), device));
     checkCudaErrors(cudaMallocManaged((void **)&s->xb2, config.dim * sizeof(float)));
+    checkCudaErrors(cudaMemPrefetchAsync(s->xb2, config.dim * sizeof(float), device));
     checkCudaErrors(cudaMallocManaged((void **)&s->hb, config.hidden_dim * sizeof(float)));
+    checkCudaErrors(cudaMemPrefetchAsync(s->hb, config.hidden_dim * sizeof(float), device));
     checkCudaErrors(cudaMallocManaged((void **)&s->hb2, config.hidden_dim * sizeof(float)));
+    checkCudaErrors(cudaMemPrefetchAsync(s->hb2, config.hidden_dim * sizeof(float), device));
     checkCudaErrors(cudaMallocManaged((void **)&s->q, config.dim * sizeof(float)));
+    checkCudaErrors(cudaMemPrefetchAsync(s->q, config.dim * sizeof(float), device));
     checkCudaErrors(cudaMallocManaged((void **)&s->key_cache, config.n_layers * config.max_seq_len * kv_dim * sizeof(float)));
+    checkCudaErrors(cudaMemPrefetchAsync(s->key_cache, config.n_layers * config.max_seq_len * kv_dim * sizeof(float), device));
     checkCudaErrors(cudaMallocManaged((void **)&s->value_cache, config.n_layers * config.max_seq_len * kv_dim * sizeof(float)));
+    checkCudaErrors(cudaMemPrefetchAsync(s->value_cache, config.n_layers * config.max_seq_len * kv_dim * sizeof(float), device));
     checkCudaErrors(cudaMallocManaged((void **)&s->att, config.n_heads * config.max_seq_len * sizeof(float)));
+    checkCudaErrors(cudaMemPrefetchAsync(s->att, config.n_heads * config.max_seq_len * sizeof(float), device));
     checkCudaErrors(cudaMallocManaged((void **)&s->logits, config.vocab_size * sizeof(float)));
+    checkCudaErrors(cudaMemPrefetchAsync(s->logits, config.vocab_size * sizeof(float), device));
 }
 
 void free_run_state(RunState *s) {
@@ -380,7 +404,7 @@ void memory_map_weights(TransformerWeights *w, Config config, float *ptr, int sh
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
-void read_checkpoint(char *checkpoint, Transformer *transformer) {
+void read_checkpoint(char *checkpoint, Transformer *transformer, int device) {
     Config *config = &(transformer->config);
     FILE *file = fopen(checkpoint, "rb");   // "rb" for openning binary file
     if (file == NULL) {fprintf(stderr, "Failed to open checkpoint file %s\n", checkpoint); exit(EXIT_FAILURE);}
@@ -401,14 +425,15 @@ void read_checkpoint(char *checkpoint, Transformer *transformer) {
     checkCudaErrors(cudaMallocManaged((void **)&transformer->data, transformer->file_size+1));
     float *weights_ptr = transformer->data + sizeof(Config) / sizeof(float);
     memory_map_weights(&transformer->weights, transformer->config, weights_ptr, shared_weights);
+    checkCudaErrors(cudaMemPrefetchAsync((const void *)weights_ptr, (size_t)((transformer->file_size+1) - sizeof(Config) / sizeof(float)), device));
     if (transformer->fd != -1) {close(transformer->fd);}
 }
 
-void build_transformer(Transformer *transformer, char *checkpoint_path) {
+void build_transformer(Transformer *transformer, char *checkpoint_path, int device) {
     // read in Config and the Weights from the checkpoint
-    read_checkpoint(checkpoint_path, transformer);
+    read_checkpoint(checkpoint_path, transformer, device);
     // allocate the RunState buffers
-    alloc_run_state(&transformer->state, transformer->config);
+    alloc_run_state(&transformer->state, transformer->config, device);
 }
 
 void free_transformer(Transformer* t) {
@@ -419,11 +444,147 @@ void free_transformer(Transformer* t) {
 }
 
 // ----------------------------------------------------------------------------
+// neural net blocks; the dynamics of the Transformer
+
+__global__ void reduce(float *partial_o, float *x) {
+    // for simplicity, we use the First Add During Load from https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf
+    extern volatile __shared__ float sdata[];
+
+    // each thread loads one element from global to shared mem
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    sdata[tid] = x[i];
+    __syncthreads();
+
+    // do reduction in shared mem
+    for (unsigned int s = 1; s < blockDim.x; s *= 2) {  // increase the stride in each thread block
+        if (tid % (2*s) == 0) {
+            sdata[tid] += sdata[tid + s];
+        }
+    }
+
+    // write to partial output
+    if (tid == 0) {
+        partial_o[blockIdx.x] = sdata[0];
+    }
+}
+
+__global__ void rmsnorm_kernel(float *o, float *partial_sum, float *x, float *weight, int size) {
+    // for simplicity, we use the First Add During Load from https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf
+    extern volatile __shared__ float sdata[];
+
+    // each thread loads one element from global to shared mem
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    sdata[tid] = x[i];
+    // __syncthreads();
+    this_thread_block().sync();
+
+    // do reduction in shared mem
+    for (unsigned int s = 1; s < blockDim.x; s *= 2) {  // increase the stride in each thread block
+        if (tid % (2*s) == 0) {
+            sdata[tid] += sdata[tid + s];
+        }
+    }
+
+    // write to partial output
+    if (tid == 0) {
+        partial_sum[blockIdx.x] = sdata[0];
+    }
+
+    // wait for all thread blocks to finish
+    grid_group grid = this_grid();
+    grid.sync();
+    
+    // only let a single thread launch the final reduction of partial sums
+    float ss = 0.0f;
+    if (tid == 0 && blockIdx.x == 0) {
+        reduce<<< 1, BLOCKSIZE, BLOCKSIZE>>>(partial_sum, partial_sum);
+        partial_sum[0] = 1.0f / sqrtf(partial_sum[0] / size + 1e-5f);
+        // ss /= size;
+        // ss += 1e-5f;
+        // ss = 1.0f / sqrtf(ss);
+    }
+
+    // wait for all thread blocks to finish
+    grid.sync();
+
+    ss = partial_sum[0];
+
+    o[i] = weight[i] * (ss * x[i]);
+}
+
+void rmsnorm(float *o, float *x, float *partial_o, float *weight, int size, int device) {
+    if (device == cudaCpuDeviceId) {
+        // calculate sum of squares
+        float ss = 0.0f;
+        for (int j = 0; j < size; j++) {
+            ss += x[j] * x[j];
+        }
+        ss /= size;
+        ss += 1e-5f;
+        ss = 1.0f / sqrtf(ss);
+        // normalize and scale
+        for (int j = 0; j < size; j++) {
+            o[j] = weight[j] * (ss * x[j]);
+        }
+    } else {
+        float ss = 0.0f;
+        const int GRIDSIZE = (int)ceil(size / BLOCKSIZE);
+        rmsnorm_kernel();
+
+        reduce<<< GRIDSIZE, BLOCKSIZE, BLOCKSIZE >>>(partial_o, x);
+        reduce<<< 1, BLOCKSIZE, BLOCKSIZE >>>(partial_o, partial_o);
+        ss = partial_o[0];  // demand paging
+        ss /= size;
+        ss += 1e-5f;
+        ss = 1.0f / sqrtf(ss);
+        // normalize and scale
+
+    }
+}
+
+
+// ----------------------------------------------------------------------------
+// utilities: time
+
+long time_in_ms() {
+    // return time in milliseconds, for benchmarking the model speed
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
+
+float* forward(Transformer *transformer, int token, int pos, int device) {
+    // a few convenience variables
+    Config* p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    RunState* s = &transformer->state;
+    float *x = s->x;
+    int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
+    int hidden_dim =  p->hidden_dim;
+    int head_size = dim / p->n_heads;
+
+    // copy the token embedding into x
+    float* content_row = w->token_embedding_table + token * dim;
+    checkCudaErrors(cudaMemcpyAsync(x, content_row, dim*sizeof(*x), cudaMemcpyDefault));
+    
+
+     // forward all the layers
+    for(unsigned long long l = 0; l < p->n_layers; l++) {
+        // attention rmsnorm
+        rmsnorm(s->xb, x, s->partial_sum, w->rms_att_weight + l*dim, dim, device);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // generation loop
 // ----------------------------------------------------------------------------
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
-    char *empty_prompt = "";
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, int device) {
+    char *empty_prompt = (char *)"";
     if (prompt == NULL) {prompt = empty_prompt;}
 
     // encode the (string) prompt into tokens sequence
@@ -431,6 +592,54 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int *prompt_tokens = NULL;
     checkCudaErrors(cudaMallocManaged((void **)&prompt_tokens, sizeof(int) * strlen(prompt)+3)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    if (num_prompt_tokens < 1) {
+        fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // start the main loop
+    // start the main loop
+    long start = 0;  // used to time our code, only initialized after first iteration
+    int next;        // will store the next token in the sequence
+    int token = prompt_tokens[0]; // kick off with the first token in the prompt
+    int pos = 0;     // position in the sequence
+    while (pos < steps) {
+
+        // forward the transformer to get logits for the next token
+        float* logits = forward(transformer, token, pos, device);
+
+        // advance the state machine
+        if (pos < num_prompt_tokens - 1) {
+            // if we are still processing the input prompt, force the next prompt token
+            next = prompt_tokens[pos + 1];
+        } else {
+            // otherwise sample the next token from the logits
+            // next = sample(sampler, logits);
+        }
+        pos++;
+        exit(-1);   // stop for now
+
+        // // data-dependent terminating condition: the BOS (=1) token delimits sequences
+        // if (next == 1) { break; }
+
+        // // print the token as string, decode it with the Tokenizer object
+        // char* piece = decode(tokenizer, token, next);
+        // safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        // fflush(stdout);
+        // token = next;
+
+        // // init the timer here because the first iteration can be slower
+        // if (start == 0) { start = time_in_ms(); }
+    }
+    printf("\n");
+
+    // report achieved tok/s (pos-1 because the timer starts after first iteration)
+    if (pos > 1) {
+        long end = time_in_ms();
+        fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
+    }
+
+    free(prompt_tokens);
 }
 
 // long arguments
@@ -446,6 +655,7 @@ static struct option long_options[] = {
     {"system-prompt", optional_argument, NULL, 'y'},
     {"ngl", optional_argument, NULL, 'l'},
     {"stream", no_argument, NULL, 'S'},
+    {"device", no_argument, NULL, 'd'},
     {"help", optional_argument, NULL, 'h'},
 };
 
@@ -464,7 +674,7 @@ void help_msg() {
     fprintf(stderr, "  -y, --system_prompt <string> (optional) system prompt in chat mode\n");
     fprintf(stderr, "  -l, --ngl <int> (optional) number of layers offload to CPU\n");
     fprintf(stderr, "  -S, --stream (optional) whether to stream outputs\n");
-    fprintf(stderr, "  -y, --system_prompt <string> (optional) system prompt in chat mode\n");
+    fprintf(stderr, "  -d, --device <int> (optional) CUDA device to use, default is 0\n");
     fprintf(stderr, "  -h, --help print this message\n");
     exit(EXIT_FAILURE);
 }
@@ -483,10 +693,11 @@ int main(int argc, char *argv[]) {
     char *system_prompt = NULL;     // optional system prompt used in chat mode
     bool stream = false;
     int layers = -1;    // layers to offload to CPU
+    int device = -1;     // cuda device
 
     // parse arguments
     int opt = 0;
-    while ((opt = getopt_long(argc, argv, "m:z:t:p:s:n:i:M:y:l:Sh",
+    while ((opt = getopt_long(argc, argv, "m:z:t:p:s:n:i:M:y:l:d:Sh",
                     long_options, NULL)) != -1) {
         switch (opt) {
             case 'm':
@@ -529,6 +740,9 @@ int main(int argc, char *argv[]) {
                 stream = true;
                 printf("stream is: %d\n", stream);
                 break;
+            case 'd':
+                device = atoi(optarg);
+                break;
             case 'h':
                 help_msg();
                 break;
@@ -546,10 +760,11 @@ int main(int argc, char *argv[]) {
     if (temperature < 0.0) {temperature = 0.0f;}
     if (topp < 0.0 || 1.0 <= topp) {topp = 0.9f;}
     if (steps < 0) {steps = 0;}
+    if (device < 0) {device = cudaCpuDeviceId;} // if not cuda device specified, use CPU
 
     // build Transformer from given model .bin file
     Transformer transformer;
-    build_transformer(&transformer, checkpoint_path);
+    build_transformer(&transformer, checkpoint_path, device);
     if (steps == 0 || steps > transformer.config.max_seq_len) {steps = transformer.config.max_seq_len;}
 
     // build the tokenizer via the tokenizer .bin file
@@ -562,7 +777,7 @@ int main(int argc, char *argv[]) {
 
     // run!
     if (strcmp(mode, "generate") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt, steps);
+        generate(&transformer, &tokenizer, &sampler, prompt, steps, device);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         help_msg();
